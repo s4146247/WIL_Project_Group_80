@@ -1,0 +1,10 @@
+streamlit
+requests
+chromadb>=0.4.5
+numpy
+pandas
+tqdm
+python-dotenv
+scipy
+langchain
+
