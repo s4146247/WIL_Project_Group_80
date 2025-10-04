@@ -264,7 +264,7 @@ if submit and (user_input and user_input.strip()):
                 f"Conversation history:\n{chat_history_text}\n\n"
                 f"Context passages (use ONLY these passages to answer). If the context doesn't contain the information, say you don't know and recommend seeing a professional:\n{context}\n\n"
                 f"Patient question: {user_input.strip()}\n\n"
-                f"Provide a short, clear answer in plain language. Then list which source rows/chunks you used (use metadata)."
+                f"Provide a short, clear answer in plain language."
             )
 
             # Initialize LLM and call it
@@ -273,7 +273,7 @@ if submit and (user_input and user_input.strip()):
                 answer_text = safe_llm_call(llm, final_prompt)
 
             # Append assistant message with sources
-            st.session_state.history.append({"role": "assistant", "content": answer_text, "sources": sources_for_ui})
+            st.session_state.history.append({"role": "assistant", "content": answer_text})
 
             # Re-render chat so the new assistant message shows immediately
             render_chat_into(chat_container)
