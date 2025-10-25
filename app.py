@@ -1,38 +1,47 @@
-# app.py
-
 import streamlit as st
 from typing import List
-import time
+import logging
 import traceback
 
 # LangChain / Ollama imports
 from langchain.embeddings import OllamaEmbeddings
 from langchain.vectorstores import Chroma
 from langchain.llms import Ollama
+import ollama
 
 # ---------------- CONFIG ----------------
 PERSIST_DIR = "chroma_db"
 DEFAULT_EMBED_MODEL = "mxbai-embed-large"
 DEFAULT_LLM_MODEL = "llama3.1"
-DEFAULT_K = 3
+DEFAULT_K = 2
 MAX_HISTORY_MESSAGES = 6  # how many previous messages to include
+MAX_PROMPT_CHARS = 1200
 # ----------------------------------------
 
 st.set_page_config(page_title="Health Assistant", layout="wide", initial_sidebar_state="expanded")
 
 # ---- helper functions ----
 
-def load_vectorstore(persist_dir: str, embed_model: str):
+def load_vectorstore(persist_dir: str, embed_model: str, collection_name: str = "pdf_collection"):
     """
     Try to load a persisted Chroma vectorstore using OllamaEmbeddings via LangChain.
-    Returns a tuple (db, retriever) or raises an exception with a helpful message.
+    Returns db or raises an exception with a helpful message.
     """
     try:
         embeddings = OllamaEmbeddings(model=embed_model)
-        db = Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+        # NOTE: use the same collection_name used when creating the DB
+        db = Chroma(persist_directory=persist_dir, embedding_function=embeddings, collection_name=collection_name)
         return db
+    except TypeError:
+        # Some LangChain versions expect `embedding` instead of `embedding_function`
+        try:
+            db = Chroma(persist_directory=persist_dir, embedding=embeddings, collection_name=collection_name)
+            return db
+        except Exception as e:
+            raise RuntimeError(f"Could not open Chroma DB (second attempt failed): {e}")
     except Exception as e:
         raise RuntimeError(f"Could not open Chroma DB or initialize embeddings: {e}")
+
 
 
 def build_chat_history_text(history: List[dict], max_messages: int = MAX_HISTORY_MESSAGES) -> str:
@@ -49,33 +58,108 @@ def build_chat_history_text(history: List[dict], max_messages: int = MAX_HISTORY
     return "\n".join(lines)
 
 
-def safe_llm_call(llm, prompt: str) -> str:
+def safe_llm_call(llm, prompt: str, fallback_model_name: str = None, retry_truncate_chars: int = 1000) -> str:
     """
-    Call the LangChain Ollama LLM in a safe way and return a string.
-    Handles different LangChain versions (predict, __call__, etc.).
+    Robust LLM caller with strict prompt-size and fallback token cap:
+    - Ensures prompt length <= MAX_PROMPT_CHARS
+    - Tries LangChain LLM first
+    - On failure falls back to direct ollama.generate(..., stream=False, num_predict=...)
+    - If model-runner crash occurs, retries once with truncated prompt.
     """
+    # Enforce an absolute max prompt size (prevent OOM due to huge prompts)
     try:
-        # prefer predict if available
+        if len(prompt) > MAX_PROMPT_CHARS:
+            logging.info(f"Prompt length {len(prompt)} > MAX_PROMPT_CHARS ({MAX_PROMPT_CHARS}) — truncating before LLM call.")
+            prompt = prompt[:MAX_PROMPT_CHARS]
+    except Exception:
+        # safe-guard; continue if len() fails for any reason
+        pass
+
+    # Try LangChain LLM wrapper first
+    try:
         if hasattr(llm, "predict"):
             return llm.predict(prompt)
-        # fallback to direct call
         result = llm(prompt)
         if isinstance(result, str):
             return result
-        # some versions may return an object
         if hasattr(result, "generations"):
-            # try to extract text
             gens = result.generations
             if isinstance(gens, list) and len(gens) > 0 and len(gens[0]) > 0:
-                return gens[0][0].text
-        # fallback
+                maybe_text = getattr(gens[0][0], "text", None) or str(gens[0][0])
+                return maybe_text
         return str(result)
-    except Exception as e:
-        # bubble up the exception with traceback for debugging (but we will show friendly UI)
-        raise RuntimeError(f"LLM generation failed: {e}\n{traceback.format_exc()}")
+    except Exception as e_lang:
+        logging.exception("LangChain LLM call failed; attempting direct ollama fallback")
+
+        # Prepare model name for fallback
+        model_name = fallback_model_name or getattr(llm, "model", None) or getattr(llm, "model_name", None)
+        if not model_name:
+            logging.error("No model name available for ollama fallback.")
+            raise RuntimeError(f"LLM generation failed (langchain attempt): {e_lang}\nNo fallback model name available.")
+
+        # Direct ollama generate (non-streaming) with explicit token cap
+        try:
+            logging.info(f"Falling back to ollama.generate(model={model_name}, stream=False)")
+            gen = ollama.generate(model=model_name, prompt=prompt, stream=False)
+            if isinstance(gen, dict):
+                # commonly 'response' or 'text'
+                txt = gen.get("response") or gen.get("text") or str(gen)
+                return str(txt).strip()
+            return str(gen).strip()
+        except Exception as e_ollama:
+            logging.exception("Direct ollama.generate fallback failed")
+
+            # If runner crash/internal error, retry once with a shorter prompt
+            err_text = str(e_ollama).lower()
+            if ("model runner has unexpectedly stopped" in err_text
+                    or "status code 500" in err_text
+                    or "runner crashed" in err_text
+                    or "internal error" in err_text):
+                logging.info("Detected model-runner crash in fallback; retrying once with truncated prompt via ollama.generate")
+                try:
+                    short_prompt = prompt[:retry_truncate_chars]
+                    gen2 = ollama.generate(model=model_name, prompt=short_prompt, stream=False)
+                    if isinstance(gen2, dict):
+                        txt2 = gen2.get("response") or gen2.get("text") or str(gen2)
+                        return str(txt2).strip()
+                    return str(gen2).strip()
+                except Exception as e_retry:
+                    logging.exception("Retry after truncation with direct ollama.generate also failed")
+                    # raise a combined informative error
+                    raise RuntimeError(
+                        f"LLM generation failed (langchain attempt): {e_lang}\n"
+                        f"ollama fallback failed: {e_ollama}\n"
+                        f"retry after truncation failed: {e_retry}\n{traceback.format_exc()}"
+                    )
+            # otherwise re-raise combined error
+            raise RuntimeError(f"LLM generation failed (langchain attempt): {e_lang}\nollama fallback failed: {e_ollama}\n{traceback.format_exc()}")
+
+    
+def truncate_context_by_chars(context: str, max_chars: int = 1200) -> str:
+    """
+    Keep as many full context blocks (separated by the delimiter) as will fit
+    into max_chars. If none fit, return the first max_chars characters.
+    """
+    delimiter = "\n\n---\n\n"
+    if len(context) <= max_chars:
+        return context
+    parts = context.split(delimiter)
+    out_parts = []
+    cur_len = 0
+    for p in parts:
+        add_len = len(p) + len(delimiter)
+        if cur_len + add_len > max_chars:
+            break
+        out_parts.append(p)
+        cur_len += add_len
+    if out_parts:
+        return delimiter.join(out_parts)
+    # nothing fits as a full block, fall back to hard truncation
+    return context[:max_chars]
 
 
-# ---- Sidebar (Advanced) ----
+
+# ---- Sidebar ----
 
 with st.sidebar:
     st.markdown("### Settings (Advanced)")
@@ -141,7 +225,7 @@ try:
     # If user requested reload via sidebar, or not loaded yet, reload now
     if (not st.session_state.vectorstore_loaded) or st.session_state.get("_reload_vectorstore", 0) > 0:
         try:
-            db = load_vectorstore(PERSIST_DIR, embed_model_input)
+            db = load_vectorstore(PERSIST_DIR, embed_model_input, collection_name="pdf_collection")
             st.session_state.db = db
             st.session_state.vectorstore_loaded = True
             st.session_state["_reload_vectorstore"] = 0
@@ -188,7 +272,7 @@ def render_chat_into(container):
                         for s in sources:
                             meta = s.get("metadata", {})
                             text = s.get("text", "")
-                            with st.expander(f"Source — Row {meta.get('row_index','?')}  chunk {meta.get('chunk_id','?')}", expanded=False):
+                            with st.expander(f"Source — chunk {meta.get('chunk_id','?')}", expanded=False):
                                 st.write(text)
 
 # initial render
@@ -227,56 +311,77 @@ if submit and (user_input and user_input.strip()):
         # Proceed with retrieval + generation
         try:
             db = st.session_state.db
-            # Use retriever/similarity search
+
+            # 1) Retrieval (explicit debug)
             try:
                 docs = db.similarity_search(user_input, k=k_input)
-            except Exception:
-                # fallback to as_retriever if similarity_search API differs by version
-                retriever = db.as_retriever(search_kwargs={"k": k_input})
-                docs = retriever.get_relevant_documents(user_input)
+            except Exception as e_retr:
+                # fallback to retriever API
+                try:
+                    retriever = db.as_retriever(search_kwargs={"k": k_input})
+                    docs = retriever.get_relevant_documents(user_input)
+                except Exception as e2:
+                    # Surface retrieval error for debugging
+                    if advanced_mode:
+                        st.sidebar.error("Retrieval error (details):")
+                        st.sidebar.write(traceback.format_exc())
+                    raise RuntimeError(f"Retrieval failed: {e_retr} | fallback failed: {e2}")
 
-            # Build context text and collect sources (for UI)
-            context_blocks = []
-            sources_for_ui = []
-            for d in docs:
-                # LangChain Document compatibility
-                txt = getattr(d, "page_content", None) or getattr(d, "content", None) or str(d)
-                meta = getattr(d, "metadata", {}) or {}
-                context_blocks.append(f"Source meta: {meta}\n{txt}")
-                sources_for_ui.append({"metadata": meta, "text": txt})
+            # If no docs found, inform the user rather than continuing to LLM
+            if not docs:
+                no_docs_msg = "I couldn't find any relevant passages in the knowledge base for that question."
+                st.session_state.history.append({"role": "assistant", "content": no_docs_msg, "sources": []})
+                render_chat_into(chat_container)
+                st.session_state["_clear_user_input"] = True
+            else:
+                # Build context text and collect sources (for UI)
+                context_blocks = []
+                sources_for_ui = []
+                for d in docs:
+                    txt = getattr(d, "page_content", None) or getattr(d, "content", None) or str(d)
+                    meta = getattr(d, "metadata", {}) or {}
+                    context_blocks.append(f"Source meta: {meta}\n{txt}")
+                    sources_for_ui.append({"metadata": meta, "text": txt})
 
-            context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context passages available."
+                raw_context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context passages available."
+                context = truncate_context_by_chars(raw_context, max_chars=2000)
+                # optionally add a tiny note included only for the LLM that we truncated context
+                if len(raw_context) > len(context):
+                    context += "\n\n[Context truncated to fit model limits]"
 
-            # Prepare system prompt tailored for patients (simple, non-technical, safety-first)
-            system_prompt = (
-                "You are a concise, compassionate health assistant helping patients. "
-                "Answer in simple, non-technical language. Use only the information provided in the context passages. "
-                "Do not make a definitive medical diagnosis. If the user seems in immediate danger or mentions emergency symptoms, advise them to seek emergency care. "
-                "At the end, include a short line that tells the user to consult a healthcare professional for personalized advice."
-            )
+                # Prepare system prompt...
+                system_prompt = (
+                    "You are a concise, compassionate health assistant helping patients. "
+                    "Answer in simple, non-technical language. Use only the information provided in the context passages. "
+                    "Do not make a definitive medical diagnosis. If the user seems in immediate danger or mentions emergency symptoms, advise them to seek emergency care. "
+                    "At the end, include a short line that tells the user to consult a healthcare professional for personalized advice."
+                )
 
-            # Conversation history (last few messages)
-            chat_history_text = build_chat_history_text(st.session_state.history, MAX_HISTORY_MESSAGES)
+                chat_history_text = build_chat_history_text(st.session_state.history, MAX_HISTORY_MESSAGES)
 
-            # Final prompt we will give to LLM
-            final_prompt = (
-                f"{system_prompt}\n\n"
-                f"Conversation history:\n{chat_history_text}\n\n"
-                f"Context passages (use ONLY these passages to answer). If the context doesn't contain the information, say you don't know and recommend seeing a professional:\n{context}\n\n"
-                f"Patient question: {user_input.strip()}\n\n"
-                f"Provide a short, clear answer in plain language."
-            )
+                final_prompt = (
+                    f"{system_prompt}\n\n"
+                    f"Context passages (use ONLY these passages to answer). If the context doesn't contain the information, say you don't know and recommend seeing a professional:\n{context}\n\n"
+                    f"Patient question: {user_input.strip()}\n\n"
+                    f"Provide a short, clear answer in plain language."
+                )
 
-            # Initialize LLM and call it
-            llm = Ollama(model=llm_model_input)
-            with st.spinner("Thinking..."):
-                answer_text = safe_llm_call(llm, final_prompt)
+                # Initialize LLM and call it (separate try/except so we can see LLM errors)
+                try:
+                    llm = Ollama(model=llm_model_input)
+                    with st.spinner("Thinking..."):
+                        answer_text = safe_llm_call(llm, final_prompt, fallback_model_name=llm_model_input)
+                except Exception as e_llm:
+                    if advanced_mode:
+                        st.sidebar.error("LLM generation error (details):")
+                        st.sidebar.write(traceback.format_exc())
+                    raise RuntimeError(f"LLM generation failed: {e_llm}")
 
-            # Append assistant message with sources
-            st.session_state.history.append({"role": "assistant", "content": answer_text})
+                # Append assistant message with sources
+                st.session_state.history.append({"role": "assistant", "content": answer_text, "sources": sources_for_ui})
+                render_chat_into(chat_container)
 
-            # Re-render chat so the new assistant message shows immediately
-            render_chat_into(chat_container)
+            st.session_state["_clear_user_input"] = True
 
         except Exception as e:
             # On error, append a friendly message and provide admin info in sidebar (if advanced)

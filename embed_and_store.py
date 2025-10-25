@@ -1,7 +1,7 @@
 from langchain.embeddings import OllamaEmbeddings
 from langchain.vectorstores import Chroma
 
-def build_vector_store(chunks, model_name="mxbai-embed-large", persist_dir="chroma_db"):
+def build_vector_store(chunks, model_name="mxbai-embed-large", persist_dir="chroma_db", collection_name="pdf_collection"):
     """
     Build a Chroma vector store from text chunks using Ollama embeddings via LangChain.
     """
@@ -12,12 +12,13 @@ def build_vector_store(chunks, model_name="mxbai-embed-large", persist_dir="chro
     # Initialize Ollama embeddings
     embeddings = OllamaEmbeddings(model=model_name)
 
-    # Build vector store in Chroma
+    # Build vector store in Chroma with explicit collection name
     db = Chroma.from_texts(
         texts=texts,
         embedding=embeddings,
         metadatas=metadatas,
-        persist_directory=persist_dir
+        persist_directory=persist_dir,
+        collection_name=collection_name
     )
     db.persist()
     return db
