@@ -7,4 +7,5 @@ tqdm
 python-dotenv
 scipy
 langchain
+pypdf
 

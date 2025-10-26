@@ -21,7 +21,7 @@ def query_rag(collection, query, k=3):
     )
     
     # 4) Generate answer with Llama3.1 via Ollama
-    response = ollama.generate(model="llama3", prompt=prompt)
+    response = ollama.generate(model="llama3.1", prompt=prompt)
     answer_text = response.get("response", "").strip()
     
     return answer_text, passages

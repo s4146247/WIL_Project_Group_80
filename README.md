@@ -7,6 +7,9 @@ Patient-facing Healthcare RAG Chatbot (Streamlit)
 - "Advanced" admin controls live in the sidebar (collapsed by default)
 
 Usage:
-  1. Ensure your environment has ollama, langchain, chromadb, streamlit, pandas.
+  1. Ensure your environment has ollama, langchain, chromadb, streamlit, pandas, pypdf.
   2. Build embeddings: python build_embeddings.py (creates ./chroma_db)
   3. Run: python -m streamlit run app.py
+
+Generate Evaluation Report:
+  1. Run: python eval_framework.py --pdf_dir data
